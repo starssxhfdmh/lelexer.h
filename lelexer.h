@@ -1,5 +1,10 @@
 /***********************************************************************************
 *
+*   lelexer.h - Single-header lexer and parser library for C
+*
+*   Author:  starssxhfdmh (https://github.com/starssxhfdmh/lelexer.h)
+*   License: MIT (see LICENSE file)
+*
 *   USAGE:
 *       #define LE_IMPLEMENTATION in exactly one source file before including this
 *       header to get the implementation. In all other files, just include the
