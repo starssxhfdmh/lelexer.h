@@ -778,7 +778,7 @@ LEDEF bool leIsAlpha(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <
 LEDEF bool leIsAlphaNum(char c) { return leIsAlpha(c) || leIsDigit(c); }
 LEDEF bool leIsHexDigit(char c) { return leIsDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
 LEDEF bool leIsSpace(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
-LEDEF bool leIsUtf8Start(unsigned char c) { return (c & 0xC0) == 0xC0; }
+LEDEF bool leIsUtf8Start(unsigned char c) { return c >= 0xC2 && c <= 0xF4; }
 LEDEF bool leIsUtf8Cont(unsigned char c) { return (c & 0xC0) == 0x80; }
 
 LEDEF int leUtf8Decode(const char *s, int len, int *codepoint) {
@@ -1469,7 +1469,9 @@ static char *leDecodeString(leLexer *lex, const char *start, int len, int *outLe
                 i++;
             } else if (next == 'x' && i + 2 < len) {
                 int value;
-                int consumed = leDecodeHexEscape(&start[i + 2], 2, &value);
+                int maxHex = len - (i + 2);
+                if (maxHex > 2) maxHex = 2;
+                int consumed = leDecodeHexEscape(&start[i + 2], maxHex, &value);
                 if (consumed > 0) {
                     buf[j++] = (char)value;
                     i += 1 + consumed;
@@ -1478,7 +1480,9 @@ static char *leDecodeString(leLexer *lex, const char *start, int len, int *outLe
                 }
             } else if (next == 'u' && i + 2 < len) {
                 int value;
-                int consumed = leDecodeHexEscape(&start[i + 2], 4, &value);
+                int maxHex = len - (i + 2);
+                if (maxHex > 4) maxHex = 4;
+                int consumed = leDecodeHexEscape(&start[i + 2], maxHex, &value);
                 if (consumed > 0 && !(value >= 0xD800 && value <= 0xDFFF) && value <= 0x10FFFF) {
                     j += leUtf8Encode(value, &buf[j]);
                     i += 1 + consumed;
@@ -1487,7 +1491,9 @@ static char *leDecodeString(leLexer *lex, const char *start, int len, int *outLe
                 }
             } else if (next == 'U' && i + 2 < len) {
                 int value;
-                int consumed = leDecodeHexEscape(&start[i + 2], 8, &value);
+                int maxHex = len - (i + 2);
+                if (maxHex > 8) maxHex = 8;
+                int consumed = leDecodeHexEscape(&start[i + 2], maxHex, &value);
                 if (consumed > 0 && !(value >= 0xD800 && value <= 0xDFFF) && value <= 0x10FFFF) {
                     j += leUtf8Encode(value, &buf[j]);
                     i += 1 + consumed;
@@ -2282,6 +2288,7 @@ LEDEF leAstNode *leParseExpr(leParser *p, int minPrec) {
         int prec = infix->precedence;
         if (prec < minPrec) break;
         if (infix->assoc == LE_ASSOC_LEFT && prec <= minPrec) break;
+        if (infix->assoc == LE_ASSOC_NONE && prec <= minPrec) break;
         tok = leParserAdvance(p);
         left = infix->fn(p, left, tok);
         if (!left) return leAstError(p, tok);
