@@ -1,7 +1,5 @@
 /***********************************************************************************
 *
-*   lelexer.h - Single-header configurable lexer/tokenizer library
-*
 *   USAGE:
 *       #define LE_IMPLEMENTATION in exactly one source file before including this
 *       header to get the implementation. In all other files, just include the
