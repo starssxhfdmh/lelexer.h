@@ -11,22 +11,24 @@
 *       header normally.
 *
 *   FEATURES:
-*       - Single-header, no external dependencies beyond libc
-*       - Configurable token types: keywords, multi-char operators, strings, numbers
-*       - Unicode identifier support (UTF-8)
-*       - Arena-based allocation, minimal heap fragmentation
-*       - Token lookahead and pushback via ring buffer
-*       - Custom lexer rules via callback functions
-*       - Structured error collection with source locations and callbacks
-*       - Escape sequence decoding for strings (\n, \t, \xNN, \uNNNN, \UNNNNNNNN)
-*       - Configurable comment syntax (line and block)
-*       - Multi-line string literal support
-*       - Case-insensitive keyword matching (optional)
-*       - Numeric underscore separators (optional)
-*       - Pratt parser with user-defined prefix/infix/statement rules
-*       - Unlimited precedence levels and configurable associativity
-*       - Arena-allocated AST nodes with minimal built-in types
+*       Lexer:
+*       - User-defined keywords, multi-char operators, and comment syntax
+*       - String and char literals with configurable delimiters and escape decoding
+*       - Multi-line string support and numeric underscore separators (optional)
+*       - UTF-8 identifier support
+*       - Token lookahead/pushback ring buffer
+*       - Custom lexer rules via callbacks
+*       - Error collection with source locations and severity levels
+*
+*       Parser:
+*       - Pratt parser with user-defined prefix, infix, and statement rules
+*       - Configurable precedence and associativity
+*       - Arena-allocated AST nodes (atom, unary, binary, list, error)
 *       - Error recovery via synchronization points
+*
+*       General:
+*       - Single-header, no dependencies beyond libc
+*       - Arena-based memory allocation
 *
 *   CONFIGURATION:
 *       #define LE_ARENA_DEFAULT_CAP    - Initial arena block size (default: 8192)
