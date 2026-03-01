@@ -3,6 +3,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+// ---------------------------------------------------------------------------
+// Token types
+// ---------------------------------------------------------------------------
 enum {
     T_PLUS = LE_USER_START, T_MINUS, T_STAR, T_SLASH, T_PERCENT, T_CARET,
     T_HASH, T_DOT, T_DOTDOT, T_DOTDOTDOT,
@@ -15,599 +18,449 @@ enum {
     KW_REPEAT, KW_RETURN, KW_THEN, KW_TRUE, KW_UNTIL, KW_WHILE,
 };
 
+// ---------------------------------------------------------------------------
+// AST node types
+// ---------------------------------------------------------------------------
 enum {
-    N_BLOCK = LE_PNODE_USER,
-    N_LOCAL, N_ASSIGN, N_IF, N_WHILE, N_REPEAT, N_FOR_NUM, N_FOR_IN,
-    N_FUNC_DECL, N_LOCAL_FUNC, N_RETURN, N_BREAK, N_CALL, N_METHOD_CALL,
-    N_INDEX, N_FIELD, N_TABLE, N_TABLE_FIELD, N_TABLE_INDEX_FIELD,
-    N_FUNC_EXPR, N_PARAM_LIST, N_VARLIST, N_EXPRLIST, N_NAMELIST,
-    N_BINOP, N_UNOP, N_BOOL, N_NIL, N_NUMBER, N_STRING, N_IDENT,
-    N_DOTDOTDOT_EXPR,
+    N_LOCAL = LE_PNODE_USER, N_ASSIGN, N_IF, N_WHILE, N_REPEAT,
+    N_FOR_NUM, N_FOR_IN, N_FUNC_DECL, N_LOCAL_FUNC, N_RETURN, N_BREAK,
+    N_CALL, N_METHOD_CALL, N_INDEX, N_FIELD, N_TABLE, N_TABLE_FIELD,
+    N_TABLE_INDEX_FIELD, N_FUNC_EXPR, N_BINOP, N_UNOP,
+    N_BOOL, N_NIL, N_NUMBER, N_STRING, N_IDENT, N_VARARG,
 };
 
-typedef struct {
-    leParser p;
-} LuaParser;
+// Precedence levels
+enum {
+    PREC_OR = 10, PREC_AND = 20, PREC_CMP = 30, PREC_CONCAT = 40,
+    PREC_ADD = 50, PREC_MUL = 60, PREC_UNARY = 80, PREC_POW = 90,
+    PREC_POSTFIX = 100,
+};
 
-static leAstNode *parseExpr(LuaParser *L);
-static leAstNode *parseBlock(LuaParser *L);
-static leAstNode *parseStat(LuaParser *L);
-static leAstNode *parsePrefixExpr(LuaParser *L);
-static leAstNode *parseExprList(LuaParser *L);
-static leAstNode *parseFuncBody(LuaParser *L);
+// ---------------------------------------------------------------------------
+// Forward declarations
+// ---------------------------------------------------------------------------
+static leAstNode *parseBlock(leParser *p);
+static leAstNode *parseExprList(leParser *p);
+static leAstNode *parseFuncBody(leParser *p);
+static leAstNode *parseArgs(leParser *p);
 
-static leAstNode *node(LuaParser *L, int type, leToken tok) {
-    return leAstNew(&L->p, type, tok);
-}
-
-static leAstNode *list(LuaParser *L) {
-    return leAstList(&L->p);
-}
-
-static leAstNode *append(LuaParser *L, leAstNode *l, leAstNode *item) {
-    return leAstListAppend(&L->p, l, item);
-}
-
-static leToken advance(LuaParser *L) {
-    return leParserAdvance(&L->p);
-}
-
-static bool check(LuaParser *L, int t) {
-    return leParserCheck(&L->p, t);
-}
-
-static bool match(LuaParser *L, int t) {
-    return leParserMatch(&L->p, t);
-}
-
-static leToken expect(LuaParser *L, int t, const char *msg) {
-    return leParserExpect(&L->p, t, msg);
-}
-
-static leToken peek(LuaParser *L) {
-    return leParserPeek(&L->p);
-}
-
-static bool atEnd(LuaParser *L) {
-    return leParserAtEnd(&L->p);
-}
-
-static bool isBlockEnd(LuaParser *L) {
-    int t = peek(L).type;
+static bool isBlockEnd(leParser *p) {
+    int t = leParserPeek(p).type;
     return t == leEOF || t == KW_END || t == KW_ELSE || t == KW_ELSEIF || t == KW_UNTIL;
 }
 
-static leAstNode *parseNameList(LuaParser *L) {
-    leAstNode *names = list(L);
-    leToken name = expect(L, leIdent, "expected name");
-    leAstNode *n = node(L, N_IDENT, name);
-    append(L, names, n);
-    while (match(L, T_COMMA)) {
-        name = expect(L, leIdent, "expected name");
-        n = node(L, N_IDENT, name);
-        append(L, names, n);
-    }
-    return names;
+// ---------------------------------------------------------------------------
+// Prefix parselets (registered via leParserPrefix)
+// ---------------------------------------------------------------------------
+static leAstNode *prefixNumber(leParser *p, leToken tok) {
+    return leAstNew(p, N_NUMBER, tok);
+}
+static leAstNode *prefixString(leParser *p, leToken tok) {
+    return leAstNew(p, N_STRING, tok);
+}
+static leAstNode *prefixBool(leParser *p, leToken tok) {
+    return leAstNew(p, N_BOOL, tok);
+}
+static leAstNode *prefixNil(leParser *p, leToken tok) {
+    return leAstNew(p, N_NIL, tok);
+}
+static leAstNode *prefixVararg(leParser *p, leToken tok) {
+    return leAstNew(p, N_VARARG, tok);
+}
+static leAstNode *prefixIdent(leParser *p, leToken tok) {
+    return leAstNew(p, N_IDENT, tok);
 }
 
-static int getUnaryPrec(int t) {
-    if (t == KW_NOT || t == T_HASH || t == T_MINUS) return 80;
-    return -1;
-}
-
-static int getBinaryPrec(int t) {
-    switch (t) {
-        case KW_OR:    return 10;
-        case KW_AND:   return 20;
-        case T_LT: case T_GT: case T_LTE: case T_GTE:
-        case T_EQEQ: case T_NEQ: return 30;
-        case T_DOTDOT: return 40;
-        case T_PLUS: case T_MINUS: return 50;
-        case T_STAR: case T_SLASH: case T_PERCENT: return 60;
-        case T_CARET:  return 90;
-        default: return -1;
-    }
-}
-
-static int isRightAssoc(int t) {
-    return t == T_CARET || t == T_DOTDOT;
-}
-
-static leAstNode *parseSimpleExpr(LuaParser *L) {
-    leToken tok = peek(L);
-
-    if (check(L, leInteger) || check(L, leFloat)) {
-        advance(L);
-        return node(L, N_NUMBER, tok);
-    }
-    if (check(L, leString)) {
-        advance(L);
-        return node(L, N_STRING, tok);
-    }
-    if (check(L, KW_TRUE)) {
-        advance(L);
-        return node(L, N_BOOL, tok);
-    }
-    if (check(L, KW_FALSE)) {
-        advance(L);
-        return node(L, N_BOOL, tok);
-    }
-    if (check(L, KW_NIL)) {
-        advance(L);
-        return node(L, N_NIL, tok);
-    }
-    if (check(L, T_DOTDOTDOT)) {
-        advance(L);
-        return node(L, N_DOTDOTDOT_EXPR, tok);
-    }
-    if (check(L, KW_FUNCTION)) {
-        advance(L);
-        return parseFuncBody(L);
-    }
-    if (check(L, T_LBRACE)) {
-        leToken brace = advance(L);
-        leAstNode *tbl = node(L, N_TABLE, brace);
-        leAstNode *fields = list(L);
-        tbl->left = fields;
-
-        if (!check(L, T_RBRACE)) {
-            for (;;) {
-                leAstNode *field;
-                if (check(L, T_LBRACKET)) {
-                    leToken lb = advance(L);
-                    leAstNode *key = parseExpr(L);
-                    expect(L, T_RBRACKET, "expected ']'");
-                    expect(L, T_EQ, "expected '='");
-                    leAstNode *val = parseExpr(L);
-                    field = node(L, N_TABLE_INDEX_FIELD, lb);
-                    field->left = key;
-                    field->right = val;
-                } else if (check(L, leIdent)) {
-                    leToken name = peek(L);
-                    leToken next;
-                    lePeekTokenN(L->p.lex, &next, 0);
-                    if (next.type == T_EQ) {
-                        advance(L);
-                        advance(L);
-                        leAstNode *val = parseExpr(L);
-                        field = node(L, N_TABLE_FIELD, name);
-                        field->left = node(L, N_IDENT, name);
-                        field->right = val;
-                    } else {
-                        field = parseExpr(L);
-                    }
-                } else {
-                    field = parseExpr(L);
-                }
-                append(L, fields, field);
-                if (!match(L, T_COMMA) && !match(L, T_SEMI)) break;
-                if (check(L, T_RBRACE)) break;
-            }
-        }
-        expect(L, T_RBRACE, "expected '}'");
-        return tbl;
-    }
-
-    return parsePrefixExpr(L);
-}
-
-static leAstNode *parseArgs(LuaParser *L) {
-    if (check(L, T_LPAREN)) {
-        advance(L);
-        leAstNode *args = NULL;
-        if (!check(L, T_RPAREN)) {
-            args = parseExprList(L);
-        } else {
-            args = list(L);
-        }
-        expect(L, T_RPAREN, "expected ')'");
-        return args;
-    }
-    if (check(L, T_LBRACE)) {
-        leAstNode *tbl = parseSimpleExpr(L);
-        leAstNode *args = list(L);
-        append(L, args, tbl);
-        return args;
-    }
-    if (check(L, leString)) {
-        leToken s = advance(L);
-        leAstNode *args = list(L);
-        append(L, args, node(L, N_STRING, s));
-        return args;
-    }
-    leParserError(&L->p, "expected function arguments");
-    return list(L);
-}
-
-static leAstNode *parsePrefixExpr(LuaParser *L) {
-    leAstNode *expr;
-
-    if (check(L, T_LPAREN)) {
-        advance(L);
-        expr = parseExpr(L);
-        expect(L, T_RPAREN, "expected ')'");
-    } else if (check(L, leIdent)) {
-        leToken name = advance(L);
-        expr = node(L, N_IDENT, name);
-    } else {
-        leParserErrorf(&L->p, "unexpected token '%.*s'", peek(L).len, peek(L).start);
-        return leAstError(&L->p, advance(L));
-    }
-
-    for (;;) {
-        if (check(L, T_DOT)) {
-            leToken dot = advance(L);
-            leToken field = expect(L, leIdent, "expected field name");
-            leAstNode *n = node(L, N_FIELD, dot);
-            n->left = expr;
-            n->right = node(L, N_IDENT, field);
-            expr = n;
-        } else if (check(L, T_LBRACKET)) {
-            leToken lb = advance(L);
-            leAstNode *idx = parseExpr(L);
-            expect(L, T_RBRACKET, "expected ']'");
-            leAstNode *n = node(L, N_INDEX, lb);
-            n->left = expr;
-            n->right = idx;
-            expr = n;
-        } else if (check(L, T_COLON)) {
-            leToken colon = advance(L);
-            leToken method = expect(L, leIdent, "expected method name");
-            leAstNode *args = parseArgs(L);
-            leAstNode *n = node(L, N_METHOD_CALL, colon);
-            n->left = expr;
-            n->right = node(L, N_IDENT, method);
-            n->extra = args;
-            expr = n;
-        } else if (check(L, T_LPAREN) || check(L, T_LBRACE) || check(L, leString)) {
-            leToken callTok = peek(L);
-            leAstNode *args = parseArgs(L);
-            leAstNode *n = node(L, N_CALL, callTok);
-            n->left = expr;
-            n->right = args;
-            expr = n;
-        } else {
-            break;
-        }
-    }
+static leAstNode *prefixGroup(leParser *p, leToken tok) {
+    (void)tok;
+    leAstNode *expr = leParseExpr(p, 0);
+    leParserExpect(p, T_RPAREN, "expected ')'");
     return expr;
 }
 
-static leAstNode *parseSubExpr(LuaParser *L, int minPrec) {
-    leAstNode *left;
-    int uPrec = getUnaryPrec(peek(L).type);
-    if (uPrec >= 0) {
-        leToken op = advance(L);
-        leAstNode *operand = parseSubExpr(L, uPrec);
-        left = node(L, N_UNOP, op);
-        left->left = operand;
-    } else {
-        left = parseSimpleExpr(L);
-    }
-
-    for (;;) {
-        int prec = getBinaryPrec(peek(L).type);
-        if (prec < 0 || prec < minPrec) break;
-        if (!isRightAssoc(peek(L).type) && prec == minPrec) break;
-
-        leToken op = advance(L);
-        int nextPrec = isRightAssoc(op.type) ? prec : prec + 1;
-        leAstNode *right = parseSubExpr(L, nextPrec);
-        leAstNode *n = node(L, N_BINOP, op);
-        n->left = left;
-        n->right = right;
-        left = n;
-    }
-    return left;
+static leAstNode *prefixUnary(leParser *p, leToken tok) {
+    leAstNode *operand = leParseExpr(p, PREC_UNARY);
+    leAstNode *n = leAstNew(p, N_UNOP, tok);
+    if (n) n->left = operand;
+    return n;
 }
 
-static leAstNode *parseExpr(LuaParser *L) {
-    return parseSubExpr(L, 0);
+static leAstNode *prefixFunction(leParser *p, leToken tok) {
+    (void)tok;
+    return parseFuncBody(p);
 }
 
-static leAstNode *parseExprList(LuaParser *L) {
-    leAstNode *el = list(L);
-    append(L, el, parseExpr(L));
-    while (match(L, T_COMMA)) {
-        append(L, el, parseExpr(L));
+static leAstNode *prefixTable(leParser *p, leToken tok) {
+    leAstNode *tbl = leAstNew(p, N_TABLE, tok);
+    leAstNode *fields = leAstList(p);
+    if (tbl) tbl->left = fields;
+
+    while (!leParserCheck(p, T_RBRACE) && !leParserAtEnd(p)) {
+        leAstNode *field;
+        if (leParserCheck(p, T_LBRACKET)) {
+            leToken lb = leParserAdvance(p);
+            leAstNode *key = leParseExpr(p, 0);
+            leParserExpect(p, T_RBRACKET, "expected ']'");
+            leParserExpect(p, T_EQ, "expected '='");
+            leAstNode *val = leParseExpr(p, 0);
+            field = leAstNew(p, N_TABLE_INDEX_FIELD, lb);
+            if (field) { field->left = key; field->right = val; }
+        } else if (leParserCheck(p, leIdent)) {
+            leToken name = leParserPeek(p);
+            leToken next;
+            lePeekTokenN(p->lex, &next, 0);
+            if (next.type == T_EQ) {
+                leParserAdvance(p);
+                leParserAdvance(p);
+                leAstNode *val = leParseExpr(p, 0);
+                field = leAstNew(p, N_TABLE_FIELD, name);
+                if (field) { field->left = leAstNew(p, N_IDENT, name); field->right = val; }
+            } else {
+                field = leParseExpr(p, 0);
+            }
+        } else {
+            field = leParseExpr(p, 0);
+        }
+        leAstListAppend(p, fields, field);
+        if (!leParserMatch(p, T_COMMA) && !leParserMatch(p, T_SEMI)) break;
     }
+    leParserExpect(p, T_RBRACE, "expected '}'");
+    return tbl;
+}
+
+// ---------------------------------------------------------------------------
+// Infix parselets (registered via leParserInfix)
+// ---------------------------------------------------------------------------
+static leAstNode *infixBinary(leParser *p, leAstNode *left, leToken tok) {
+    int prec = leParserGetPrec(p, tok.type);
+    int assoc = leParserGetAssoc(p, tok.type);
+    int nextPrec = (assoc == LE_ASSOC_RIGHT) ? prec : prec + 1;
+    leAstNode *right = leParseExpr(p, nextPrec);
+    leAstNode *n = leAstNew(p, N_BINOP, tok);
+    if (n) { n->left = left; n->right = right; }
+    return n;
+}
+
+static leAstNode *infixDot(leParser *p, leAstNode *left, leToken tok) {
+    leToken field = leParserExpect(p, leIdent, "expected field name");
+    leAstNode *n = leAstNew(p, N_FIELD, tok);
+    if (n) { n->left = left; n->right = leAstNew(p, N_IDENT, field); }
+    return n;
+}
+
+static leAstNode *infixIndex(leParser *p, leAstNode *left, leToken tok) {
+    leAstNode *idx = leParseExpr(p, 0);
+    leParserExpect(p, T_RBRACKET, "expected ']'");
+    leAstNode *n = leAstNew(p, N_INDEX, tok);
+    if (n) { n->left = left; n->right = idx; }
+    return n;
+}
+
+static leAstNode *infixCall(leParser *p, leAstNode *left, leToken tok) {
+    leAstNode *args = leParserCheck(p, T_RPAREN) ? leAstList(p) : parseExprList(p);
+    leParserExpect(p, T_RPAREN, "expected ')'");
+    leAstNode *n = leAstNew(p, N_CALL, tok);
+    if (n) { n->left = left; n->right = args; }
+    return n;
+}
+
+static leAstNode *infixTableCall(leParser *p, leAstNode *left, leToken tok) {
+    leAstNode *tbl = prefixTable(p, tok);
+    leAstNode *args = leAstList(p);
+    leAstListAppend(p, args, tbl);
+    leAstNode *n = leAstNew(p, N_CALL, tok);
+    if (n) { n->left = left; n->right = args; }
+    return n;
+}
+
+static leAstNode *infixStringCall(leParser *p, leAstNode *left, leToken tok) {
+    leAstNode *args = leAstList(p);
+    leAstListAppend(p, args, leAstNew(p, N_STRING, tok));
+    leAstNode *n = leAstNew(p, N_CALL, tok);
+    if (n) { n->left = left; n->right = args; }
+    return n;
+}
+
+static leAstNode *infixMethod(leParser *p, leAstNode *left, leToken tok) {
+    leToken method = leParserExpect(p, leIdent, "expected method name");
+    leAstNode *args = parseArgs(p);
+    leAstNode *n = leAstNew(p, N_METHOD_CALL, tok);
+    if (n) { n->left = left; n->right = leAstNew(p, N_IDENT, method); n->extra = args; }
+    return n;
+}
+
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
+static leAstNode *parseArgs(leParser *p) {
+    if (leParserCheck(p, T_LPAREN)) {
+        leParserAdvance(p);
+        leAstNode *args = leParserCheck(p, T_RPAREN) ? leAstList(p) : parseExprList(p);
+        leParserExpect(p, T_RPAREN, "expected ')'");
+        return args;
+    }
+    if (leParserCheck(p, T_LBRACE)) {
+        leToken t = leParserAdvance(p);
+        leAstNode *tbl = prefixTable(p, t);
+        leAstNode *args = leAstList(p);
+        leAstListAppend(p, args, tbl);
+        return args;
+    }
+    if (leParserCheck(p, leString)) {
+        leToken s = leParserAdvance(p);
+        leAstNode *args = leAstList(p);
+        leAstListAppend(p, args, leAstNew(p, N_STRING, s));
+        return args;
+    }
+    leParserError(p, "expected function arguments");
+    return leAstList(p);
+}
+
+static leAstNode *parseExprList(leParser *p) {
+    leAstNode *el = leAstList(p);
+    leAstListAppend(p, el, leParseExpr(p, 0));
+    while (leParserMatch(p, T_COMMA))
+        leAstListAppend(p, el, leParseExpr(p, 0));
     return el;
 }
 
-static leAstNode *parseVarList(LuaParser *L, leAstNode *first) {
-    leAstNode *vl = list(L);
-    append(L, vl, first);
-    while (match(L, T_COMMA)) {
-        append(L, vl, parsePrefixExpr(L));
-    }
-    return vl;
-}
-
-static leAstNode *parseFuncName(LuaParser *L) {
-    leToken name = expect(L, leIdent, "expected function name");
-    leAstNode *expr = node(L, N_IDENT, name);
-    while (match(L, T_DOT)) {
-        leToken field = expect(L, leIdent, "expected field name");
-        leAstNode *n = node(L, N_FIELD, field);
-        n->left = expr;
-        n->right = node(L, N_IDENT, field);
-        expr = n;
-    }
-    if (match(L, T_COLON)) {
-        leToken method = expect(L, leIdent, "expected method name");
-        leAstNode *n = node(L, N_FIELD, method);
-        n->left = expr;
-        n->right = node(L, N_IDENT, method);
-        expr = n;
-    }
-    return expr;
-}
-
-static leAstNode *parseFuncBody(LuaParser *L) {
-    leToken tok = peek(L);
-    expect(L, T_LPAREN, "expected '('");
-    leAstNode *params = list(L);
-    if (!check(L, T_RPAREN)) {
-        if (check(L, T_DOTDOTDOT)) {
-            append(L, params, node(L, N_DOTDOTDOT_EXPR, advance(L)));
+static leAstNode *parseFuncBody(leParser *p) {
+    leToken tok = leParserPeek(p);
+    leParserExpect(p, T_LPAREN, "expected '('");
+    leAstNode *params = leAstList(p);
+    if (!leParserCheck(p, T_RPAREN)) {
+        if (leParserCheck(p, T_DOTDOTDOT)) {
+            leAstListAppend(p, params, leAstNew(p, N_VARARG, leParserAdvance(p)));
         } else {
-            leToken name = expect(L, leIdent, "expected parameter name");
-            append(L, params, node(L, N_IDENT, name));
-            while (match(L, T_COMMA)) {
-                if (check(L, T_DOTDOTDOT)) {
-                    append(L, params, node(L, N_DOTDOTDOT_EXPR, advance(L)));
+            leAstListAppend(p, params, leAstNew(p, N_IDENT, leParserExpect(p, leIdent, "expected parameter")));
+            while (leParserMatch(p, T_COMMA)) {
+                if (leParserCheck(p, T_DOTDOTDOT)) {
+                    leAstListAppend(p, params, leAstNew(p, N_VARARG, leParserAdvance(p)));
                     break;
                 }
-                name = expect(L, leIdent, "expected parameter name");
-                append(L, params, node(L, N_IDENT, name));
+                leAstListAppend(p, params, leAstNew(p, N_IDENT, leParserExpect(p, leIdent, "expected parameter")));
             }
         }
     }
-    expect(L, T_RPAREN, "expected ')'");
-    leAstNode *body = parseBlock(L);
-    expect(L, KW_END, "expected 'end'");
-    leAstNode *fn = node(L, N_FUNC_EXPR, tok);
-    fn->left = params;
-    fn->right = body;
+    leParserExpect(p, T_RPAREN, "expected ')'");
+    leAstNode *body = parseBlock(p);
+    leParserExpect(p, KW_END, "expected 'end'");
+    leAstNode *fn = leAstNew(p, N_FUNC_EXPR, tok);
+    if (fn) { fn->left = params; fn->right = body; }
     return fn;
 }
 
-static leAstNode *parseStat(LuaParser *L) {
-    match(L, T_SEMI);
-    if (isBlockEnd(L)) return NULL;
-
-    if (check(L, KW_IF)) {
-        leToken tok = advance(L);
-        leAstNode *ifn = node(L, N_IF, tok);
-        leAstNode *clauses = list(L);
-        ifn->left = clauses;
-
-        leAstNode *cond = parseExpr(L);
-        expect(L, KW_THEN, "expected 'then'");
-        leAstNode *body = parseBlock(L);
-        leAstNode *clause = node(L, N_IF, tok);
-        clause->left = cond;
-        clause->right = body;
-        append(L, clauses, clause);
-
-        while (check(L, KW_ELSEIF)) {
-            leToken eitok = advance(L);
-            cond = parseExpr(L);
-            expect(L, KW_THEN, "expected 'then'");
-            body = parseBlock(L);
-            clause = node(L, N_IF, eitok);
-            clause->left = cond;
-            clause->right = body;
-            append(L, clauses, clause);
-        }
-
-        if (check(L, KW_ELSE)) {
-            leToken etok = advance(L);
-            body = parseBlock(L);
-            clause = node(L, N_IF, etok);
-            clause->left = NULL;
-            clause->right = body;
-            append(L, clauses, clause);
-        }
-        expect(L, KW_END, "expected 'end'");
-        return ifn;
+static leAstNode *parseFuncName(leParser *p) {
+    leAstNode *expr = leAstNew(p, N_IDENT, leParserExpect(p, leIdent, "expected function name"));
+    while (leParserMatch(p, T_DOT)) {
+        leToken f = leParserExpect(p, leIdent, "expected field name");
+        leAstNode *n = leAstNew(p, N_FIELD, f);
+        if (n) { n->left = expr; n->right = leAstNew(p, N_IDENT, f); }
+        expr = n;
     }
-
-    if (check(L, KW_WHILE)) {
-        leToken tok = advance(L);
-        leAstNode *cond = parseExpr(L);
-        expect(L, KW_DO, "expected 'do'");
-        leAstNode *body = parseBlock(L);
-        expect(L, KW_END, "expected 'end'");
-        leAstNode *n = node(L, N_WHILE, tok);
-        n->left = cond;
-        n->right = body;
-        return n;
+    if (leParserMatch(p, T_COLON)) {
+        leToken m = leParserExpect(p, leIdent, "expected method name");
+        leAstNode *n = leAstNew(p, N_FIELD, m);
+        if (n) { n->left = expr; n->right = leAstNew(p, N_IDENT, m); }
+        expr = n;
     }
-
-    if (check(L, KW_REPEAT)) {
-        leToken tok = advance(L);
-        leAstNode *body = parseBlock(L);
-        expect(L, KW_UNTIL, "expected 'until'");
-        leAstNode *cond = parseExpr(L);
-        leAstNode *n = node(L, N_REPEAT, tok);
-        n->left = body;
-        n->right = cond;
-        return n;
-    }
-
-    if (check(L, KW_FOR)) {
-        leToken tok = advance(L);
-        leToken name = expect(L, leIdent, "expected name");
-
-        if (match(L, T_EQ)) {
-            leAstNode *init = parseExpr(L);
-            expect(L, T_COMMA, "expected ','");
-            leAstNode *limit = parseExpr(L);
-            leAstNode *step = NULL;
-            if (match(L, T_COMMA)) {
-                step = parseExpr(L);
-            }
-            expect(L, KW_DO, "expected 'do'");
-            leAstNode *body = parseBlock(L);
-            expect(L, KW_END, "expected 'end'");
-
-            leAstNode *n = node(L, N_FOR_NUM, tok);
-            leAstNode *params = list(L);
-            append(L, params, node(L, N_IDENT, name));
-            append(L, params, init);
-            append(L, params, limit);
-            if (step) append(L, params, step);
-            n->left = params;
-            n->right = body;
-            return n;
-        } else {
-            leAstNode *names = list(L);
-            append(L, names, node(L, N_IDENT, name));
-            while (match(L, T_COMMA)) {
-                leToken n2 = expect(L, leIdent, "expected name");
-                append(L, names, node(L, N_IDENT, n2));
-            }
-            expect(L, KW_IN, "expected 'in'");
-            leAstNode *iters = parseExprList(L);
-            expect(L, KW_DO, "expected 'do'");
-            leAstNode *body = parseBlock(L);
-            expect(L, KW_END, "expected 'end'");
-
-            leAstNode *n = node(L, N_FOR_IN, tok);
-            n->left = names;
-            n->right = iters;
-            n->extra = body;
-            return n;
-        }
-    }
-
-    if (check(L, KW_FUNCTION)) {
-        leToken tok = advance(L);
-        leAstNode *name = parseFuncName(L);
-        leAstNode *fn = parseFuncBody(L);
-        leAstNode *n = node(L, N_FUNC_DECL, tok);
-        n->left = name;
-        n->right = fn;
-        return n;
-    }
-
-    if (check(L, KW_LOCAL)) {
-        leToken tok = advance(L);
-        if (check(L, KW_FUNCTION)) {
-            advance(L);
-            leToken name = expect(L, leIdent, "expected function name");
-            leAstNode *fn = parseFuncBody(L);
-            leAstNode *n = node(L, N_LOCAL_FUNC, tok);
-            n->left = node(L, N_IDENT, name);
-            n->right = fn;
-            return n;
-        }
-        leAstNode *names = parseNameList(L);
-        leAstNode *values = NULL;
-        if (match(L, T_EQ)) {
-            values = parseExprList(L);
-        }
-        leAstNode *n = node(L, N_LOCAL, tok);
-        n->left = names;
-        n->right = values;
-        return n;
-    }
-
-    if (check(L, KW_RETURN)) {
-        leToken tok = advance(L);
-        leAstNode *n = node(L, N_RETURN, tok);
-        if (!isBlockEnd(L) && !check(L, T_SEMI)) {
-            n->left = parseExprList(L);
-        }
-        match(L, T_SEMI);
-        return n;
-    }
-
-    if (check(L, KW_BREAK)) {
-        leToken tok = advance(L);
-        return node(L, N_BREAK, tok);
-    }
-
-    if (check(L, KW_DO)) {
-        advance(L);
-        leAstNode *body = parseBlock(L);
-        expect(L, KW_END, "expected 'end'");
-        return body;
-    }
-
-    leAstNode *expr = parsePrefixExpr(L);
-
-    if (check(L, T_COMMA) || check(L, T_EQ)) {
-        leAstNode *vars = parseVarList(L, expr);
-        expect(L, T_EQ, "expected '='");
-        leAstNode *vals = parseExprList(L);
-        leToken eqTok = leParserPrevious(&L->p);
-        leAstNode *n = node(L, N_ASSIGN, eqTok);
-        n->left = vars;
-        n->right = vals;
-        return n;
-    }
-
-    if (expr->type == N_CALL || expr->type == N_METHOD_CALL) {
-        return expr;
-    }
-
     return expr;
 }
 
-static leAstNode *parseBlock(LuaParser *L) {
-    leAstNode *block = list(L);
-    while (!isBlockEnd(L)) {
-        leAstNode *s = parseStat(L);
-        if (s) append(L, block, s);
+static leAstNode *parseNameList(leParser *p) {
+    leAstNode *names = leAstList(p);
+    leAstListAppend(p, names, leAstNew(p, N_IDENT, leParserExpect(p, leIdent, "expected name")));
+    while (leParserMatch(p, T_COMMA))
+        leAstListAppend(p, names, leAstNew(p, N_IDENT, leParserExpect(p, leIdent, "expected name")));
+    return names;
+}
+
+// ---------------------------------------------------------------------------
+// Statement parselets (registered via leParserStmt)
+// ---------------------------------------------------------------------------
+static leAstNode *stmtIf(leParser *p, leToken tok) {
+    leAstNode *ifn = leAstNew(p, N_IF, tok);
+    leAstNode *clauses = leAstList(p);
+    if (ifn) ifn->left = clauses;
+
+    leAstNode *cond = leParseExpr(p, 0);
+    leParserExpect(p, KW_THEN, "expected 'then'");
+    leAstNode *clause = leAstNew(p, N_IF, tok);
+    if (clause) { clause->left = cond; clause->right = parseBlock(p); }
+    leAstListAppend(p, clauses, clause);
+
+    while (leParserCheck(p, KW_ELSEIF)) {
+        leToken ei = leParserAdvance(p);
+        cond = leParseExpr(p, 0);
+        leParserExpect(p, KW_THEN, "expected 'then'");
+        clause = leAstNew(p, N_IF, ei);
+        if (clause) { clause->left = cond; clause->right = parseBlock(p); }
+        leAstListAppend(p, clauses, clause);
+    }
+    if (leParserCheck(p, KW_ELSE)) {
+        leToken el = leParserAdvance(p);
+        clause = leAstNew(p, N_IF, el);
+        if (clause) { clause->left = NULL; clause->right = parseBlock(p); }
+        leAstListAppend(p, clauses, clause);
+    }
+    leParserExpect(p, KW_END, "expected 'end'");
+    return ifn;
+}
+
+static leAstNode *stmtWhile(leParser *p, leToken tok) {
+    leAstNode *cond = leParseExpr(p, 0);
+    leParserExpect(p, KW_DO, "expected 'do'");
+    leAstNode *body = parseBlock(p);
+    leParserExpect(p, KW_END, "expected 'end'");
+    leAstNode *n = leAstNew(p, N_WHILE, tok);
+    if (n) { n->left = cond; n->right = body; }
+    return n;
+}
+
+static leAstNode *stmtRepeat(leParser *p, leToken tok) {
+    leAstNode *body = parseBlock(p);
+    leParserExpect(p, KW_UNTIL, "expected 'until'");
+    leAstNode *cond = leParseExpr(p, 0);
+    leAstNode *n = leAstNew(p, N_REPEAT, tok);
+    if (n) { n->left = body; n->right = cond; }
+    return n;
+}
+
+static leAstNode *stmtFor(leParser *p, leToken tok) {
+    leToken name = leParserExpect(p, leIdent, "expected name");
+    if (leParserMatch(p, T_EQ)) {
+        leAstNode *init = leParseExpr(p, 0);
+        leParserExpect(p, T_COMMA, "expected ','");
+        leAstNode *limit = leParseExpr(p, 0);
+        leAstNode *step = leParserMatch(p, T_COMMA) ? leParseExpr(p, 0) : NULL;
+        leParserExpect(p, KW_DO, "expected 'do'");
+        leAstNode *body = parseBlock(p);
+        leParserExpect(p, KW_END, "expected 'end'");
+        leAstNode *params = leAstList(p);
+        leAstListAppend(p, params, leAstNew(p, N_IDENT, name));
+        leAstListAppend(p, params, init);
+        leAstListAppend(p, params, limit);
+        if (step) leAstListAppend(p, params, step);
+        leAstNode *n = leAstNew(p, N_FOR_NUM, tok);
+        if (n) { n->left = params; n->right = body; }
+        return n;
+    }
+    leAstNode *names = leAstList(p);
+    leAstListAppend(p, names, leAstNew(p, N_IDENT, name));
+    while (leParserMatch(p, T_COMMA))
+        leAstListAppend(p, names, leAstNew(p, N_IDENT, leParserExpect(p, leIdent, "expected name")));
+    leParserExpect(p, KW_IN, "expected 'in'");
+    leAstNode *iters = parseExprList(p);
+    leParserExpect(p, KW_DO, "expected 'do'");
+    leAstNode *body = parseBlock(p);
+    leParserExpect(p, KW_END, "expected 'end'");
+    leAstNode *n = leAstNew(p, N_FOR_IN, tok);
+    if (n) { n->left = names; n->right = iters; n->extra = body; }
+    return n;
+}
+
+static leAstNode *stmtFunction(leParser *p, leToken tok) {
+    leAstNode *name = parseFuncName(p);
+    leAstNode *fn = parseFuncBody(p);
+    leAstNode *n = leAstNew(p, N_FUNC_DECL, tok);
+    if (n) { n->left = name; n->right = fn; }
+    return n;
+}
+
+static leAstNode *stmtLocal(leParser *p, leToken tok) {
+    if (leParserCheck(p, KW_FUNCTION)) {
+        leParserAdvance(p);
+        leToken name = leParserExpect(p, leIdent, "expected function name");
+        leAstNode *fn = parseFuncBody(p);
+        leAstNode *n = leAstNew(p, N_LOCAL_FUNC, tok);
+        if (n) { n->left = leAstNew(p, N_IDENT, name); n->right = fn; }
+        return n;
+    }
+    leAstNode *names = parseNameList(p);
+    leAstNode *values = leParserMatch(p, T_EQ) ? parseExprList(p) : NULL;
+    leAstNode *n = leAstNew(p, N_LOCAL, tok);
+    if (n) { n->left = names; n->right = values; }
+    return n;
+}
+
+static leAstNode *stmtReturn(leParser *p, leToken tok) {
+    leAstNode *n = leAstNew(p, N_RETURN, tok);
+    if (n && !isBlockEnd(p) && !leParserCheck(p, T_SEMI))
+        n->left = parseExprList(p);
+    leParserMatch(p, T_SEMI);
+    return n;
+}
+
+static leAstNode *stmtBreak(leParser *p, leToken tok) {
+    return leAstNew(p, N_BREAK, tok);
+}
+
+static leAstNode *stmtDo(leParser *p, leToken tok) {
+    (void)tok;
+    leAstNode *body = parseBlock(p);
+    leParserExpect(p, KW_END, "expected 'end'");
+    return body;
+}
+
+// ---------------------------------------------------------------------------
+// Block and statement parsing
+// ---------------------------------------------------------------------------
+static leAstNode *parseStat(leParser *p) {
+    leParserMatch(p, T_SEMI);
+    if (isBlockEnd(p)) return NULL;
+
+    // Use registered statement parselets for keyword statements
+    if (leParserHasStmt(p, leParserPeek(p).type))
+        return leParseStmt(p);
+
+    // Expression statement or assignment (uses registered prefix/infix rules)
+    leAstNode *expr = leParseExpr(p, 0);
+    if (p->panicMode) { leParserSynchronize(p); return expr; }
+
+    if (leParserCheck(p, T_COMMA) || leParserCheck(p, T_EQ)) {
+        leAstNode *vars = leAstList(p);
+        leAstListAppend(p, vars, expr);
+        while (leParserMatch(p, T_COMMA))
+            leAstListAppend(p, vars, leParseExpr(p, 0));
+        leParserExpect(p, T_EQ, "expected '='");
+        leAstNode *vals = parseExprList(p);
+        leAstNode *n = leAstNew(p, N_ASSIGN, leParserPrevious(p));
+        if (n) { n->left = vars; n->right = vals; }
+        return n;
+    }
+    return expr;
+}
+
+static leAstNode *parseBlock(leParser *p) {
+    leAstNode *block = leAstList(p);
+    while (!isBlockEnd(p)) {
+        leAstNode *s = parseStat(p);
+        if (s) leAstListAppend(p, block, s);
         else break;
     }
     return block;
 }
 
-static void luaParserInit(LuaParser *L, leLexer *lex) {
-    leParserInit(&L->p, lex);
-}
-
-static void luaParserFree(LuaParser *L) {
-    leParserFree(&L->p);
-}
-
+// ---------------------------------------------------------------------------
+// AST printing
+// ---------------------------------------------------------------------------
 static const char *nodeTypeName(int type) {
     switch (type) {
-        case N_BLOCK: return "Block";
-        case N_LOCAL: return "Local";
-        case N_ASSIGN: return "Assign";
-        case N_IF: return "If";
-        case N_WHILE: return "While";
-        case N_REPEAT: return "Repeat";
-        case N_FOR_NUM: return "ForNum";
-        case N_FOR_IN: return "ForIn";
-        case N_FUNC_DECL: return "FuncDecl";
-        case N_LOCAL_FUNC: return "LocalFunc";
-        case N_RETURN: return "Return";
-        case N_BREAK: return "Break";
-        case N_CALL: return "Call";
-        case N_METHOD_CALL: return "MethodCall";
-        case N_INDEX: return "Index";
-        case N_FIELD: return "Field";
-        case N_TABLE: return "Table";
+        case N_LOCAL: return "Local"; case N_ASSIGN: return "Assign";
+        case N_IF: return "If"; case N_WHILE: return "While";
+        case N_REPEAT: return "Repeat"; case N_FOR_NUM: return "ForNum";
+        case N_FOR_IN: return "ForIn"; case N_FUNC_DECL: return "FuncDecl";
+        case N_LOCAL_FUNC: return "LocalFunc"; case N_RETURN: return "Return";
+        case N_BREAK: return "Break"; case N_CALL: return "Call";
+        case N_METHOD_CALL: return "MethodCall"; case N_INDEX: return "Index";
+        case N_FIELD: return "Field"; case N_TABLE: return "Table";
         case N_TABLE_FIELD: return "TableField";
         case N_TABLE_INDEX_FIELD: return "TableIdxField";
-        case N_FUNC_EXPR: return "FuncExpr";
-        case N_PARAM_LIST: return "ParamList";
-        case N_VARLIST: return "VarList";
-        case N_EXPRLIST: return "ExprList";
-        case N_NAMELIST: return "NameList";
-        case N_BINOP: return "BinOp";
-        case N_UNOP: return "UnOp";
-        case N_BOOL: return "Bool";
-        case N_NIL: return "Nil";
-        case N_NUMBER: return "Number";
-        case N_STRING: return "String";
-        case N_IDENT: return "Ident";
-        case N_DOTDOTDOT_EXPR: return "Vararg";
+        case N_FUNC_EXPR: return "FuncExpr"; case N_BINOP: return "BinOp";
+        case N_UNOP: return "UnOp"; case N_BOOL: return "Bool";
+        case N_NIL: return "Nil"; case N_NUMBER: return "Number";
+        case N_STRING: return "String"; case N_IDENT: return "Ident";
+        case N_VARARG: return "Vararg";
         default: return leAstNodeTypeName(type);
     }
 }
@@ -619,13 +472,8 @@ static void printAST(leAstNode *n, int indent) {
     if (n->token.start && n->token.len > 0 && n->token.len < 80)
         printf(" \"%.*s\"", n->token.len, n->token.start);
     printf("\n");
-
     if (n->type == LE_PNODE_LIST) {
-        leAstNode *c = n->left;
-        while (c) {
-            printAST(c, indent + 1);
-            c = c->next;
-        }
+        for (leAstNode *c = n->left; c; c = c->next) printAST(c, indent + 1);
     } else {
         if (n->left) printAST(n->left, indent + 1);
         if (n->right) printAST(n->right, indent + 1);
@@ -633,6 +481,104 @@ static void printAST(leAstNode *n, int indent) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Setup: register all parselets and language configuration
+// ---------------------------------------------------------------------------
+static void setupLexer(leLexer *lex) {
+    leLineComment(lex, "--");
+    leBlockComment(lex, "--[[", "]]");
+
+    leOperators(lex,
+        "+", T_PLUS, "-", T_MINUS, "*", T_STAR, "/", T_SLASH,
+        "%", T_PERCENT, "^", T_CARET, "#", T_HASH,
+        "...", T_DOTDOTDOT, "..", T_DOTDOT, ".", T_DOT,
+        "==", T_EQEQ, "~=", T_NEQ, "<=", T_LTE, ">=", T_GTE,
+        "<", T_LT, ">", T_GT, "=", T_EQ,
+        "(", T_LPAREN, ")", T_RPAREN,
+        "[", T_LBRACKET, "]", T_RBRACKET,
+        "{", T_LBRACE, "}", T_RBRACE,
+        ";", T_SEMI, ":", T_COLON, ",", T_COMMA,
+        NULL);
+
+    leKeywords(lex,
+        "and", KW_AND, "break", KW_BREAK, "do", KW_DO,
+        "else", KW_ELSE, "elseif", KW_ELSEIF, "end", KW_END,
+        "false", KW_FALSE, "for", KW_FOR, "function", KW_FUNCTION,
+        "if", KW_IF, "in", KW_IN, "local", KW_LOCAL,
+        "nil", KW_NIL, "not", KW_NOT, "or", KW_OR,
+        "repeat", KW_REPEAT, "return", KW_RETURN, "then", KW_THEN,
+        "true", KW_TRUE, "until", KW_UNTIL, "while", KW_WHILE,
+        NULL);
+}
+
+static void setupParser(leParser *p) {
+    // Prefix rules: atoms
+    leParserPrefix(p, leInteger,    prefixNumber);
+    leParserPrefix(p, leFloat,      prefixNumber);
+    leParserPrefix(p, leString,     prefixString);
+    leParserPrefix(p, KW_TRUE,      prefixBool);
+    leParserPrefix(p, KW_FALSE,     prefixBool);
+    leParserPrefix(p, KW_NIL,       prefixNil);
+    leParserPrefix(p, T_DOTDOTDOT,  prefixVararg);
+    leParserPrefix(p, leIdent,      prefixIdent);
+    leParserPrefix(p, T_LPAREN,     prefixGroup);
+    leParserPrefix(p, T_LBRACE,     prefixTable);
+    leParserPrefix(p, KW_FUNCTION,  prefixFunction);
+
+    // Prefix rules: unary operators
+    leParserPrefix(p, T_MINUS, prefixUnary);
+    leParserPrefix(p, KW_NOT,  prefixUnary);
+    leParserPrefix(p, T_HASH,  prefixUnary);
+
+    // Infix rules: binary operators (with precedence and associativity)
+    leParserInfix(p, KW_OR,    PREC_OR,     LE_ASSOC_LEFT,  infixBinary);
+    leParserInfix(p, KW_AND,   PREC_AND,    LE_ASSOC_LEFT,  infixBinary);
+    leParserInfix(p, T_LT,     PREC_CMP,    LE_ASSOC_LEFT,  infixBinary);
+    leParserInfix(p, T_GT,     PREC_CMP,    LE_ASSOC_LEFT,  infixBinary);
+    leParserInfix(p, T_LTE,    PREC_CMP,    LE_ASSOC_LEFT,  infixBinary);
+    leParserInfix(p, T_GTE,    PREC_CMP,    LE_ASSOC_LEFT,  infixBinary);
+    leParserInfix(p, T_EQEQ,   PREC_CMP,    LE_ASSOC_LEFT,  infixBinary);
+    leParserInfix(p, T_NEQ,    PREC_CMP,    LE_ASSOC_LEFT,  infixBinary);
+    leParserInfix(p, T_DOTDOT, PREC_CONCAT, LE_ASSOC_RIGHT, infixBinary);
+    leParserInfix(p, T_PLUS,   PREC_ADD,    LE_ASSOC_LEFT,  infixBinary);
+    leParserInfix(p, T_MINUS,  PREC_ADD,    LE_ASSOC_LEFT,  infixBinary);
+    leParserInfix(p, T_STAR,   PREC_MUL,    LE_ASSOC_LEFT,  infixBinary);
+    leParserInfix(p, T_SLASH,  PREC_MUL,    LE_ASSOC_LEFT,  infixBinary);
+    leParserInfix(p, T_PERCENT,PREC_MUL,    LE_ASSOC_LEFT,  infixBinary);
+    leParserInfix(p, T_CARET,  PREC_POW,    LE_ASSOC_RIGHT, infixBinary);
+
+    // Infix rules: postfix operations (call, field, index, method)
+    leParserInfix(p, T_DOT,      PREC_POSTFIX, LE_ASSOC_LEFT, infixDot);
+    leParserInfix(p, T_LBRACKET, PREC_POSTFIX, LE_ASSOC_LEFT, infixIndex);
+    leParserInfix(p, T_LPAREN,   PREC_POSTFIX, LE_ASSOC_LEFT, infixCall);
+    leParserInfix(p, T_LBRACE,   PREC_POSTFIX, LE_ASSOC_LEFT, infixTableCall);
+    leParserInfix(p, leString,   PREC_POSTFIX, LE_ASSOC_LEFT, infixStringCall);
+    leParserInfix(p, T_COLON,    PREC_POSTFIX, LE_ASSOC_LEFT, infixMethod);
+
+    // Statement rules
+    leParserStmt(p, KW_IF,       stmtIf);
+    leParserStmt(p, KW_WHILE,    stmtWhile);
+    leParserStmt(p, KW_REPEAT,   stmtRepeat);
+    leParserStmt(p, KW_FOR,      stmtFor);
+    leParserStmt(p, KW_FUNCTION, stmtFunction);
+    leParserStmt(p, KW_LOCAL,    stmtLocal);
+    leParserStmt(p, KW_RETURN,   stmtReturn);
+    leParserStmt(p, KW_BREAK,    stmtBreak);
+    leParserStmt(p, KW_DO,       stmtDo);
+
+    // Error recovery sync points
+    leParserSyncOn(p, KW_IF);
+    leParserSyncOn(p, KW_WHILE);
+    leParserSyncOn(p, KW_FOR);
+    leParserSyncOn(p, KW_FUNCTION);
+    leParserSyncOn(p, KW_LOCAL);
+    leParserSyncOn(p, KW_RETURN);
+    leParserSyncOn(p, KW_END);
+}
+
+// ---------------------------------------------------------------------------
+// Test program
+// ---------------------------------------------------------------------------
 static const char *test_program =
     "local x = 10\n"
     "local y, z = 20, 30\n"
@@ -689,6 +635,7 @@ static const char *test_program =
 
 int main(int argc, char **argv) {
     const char *source = test_program;
+    char *fileBuf = NULL;
 
     if (argc > 1) {
         FILE *f = fopen(argv[1], "rb");
@@ -696,60 +643,35 @@ int main(int argc, char **argv) {
         fseek(f, 0, SEEK_END);
         long len = ftell(f);
         fseek(f, 0, SEEK_SET);
-        char *buf = (char *)malloc(len + 1);
-        fread(buf, 1, len, f);
-        buf[len] = '\0';
+        fileBuf = (char *)malloc(len + 1);
+        fread(fileBuf, 1, len, f);
+        fileBuf[len] = '\0';
         fclose(f);
-        source = buf;
+        source = fileBuf;
     }
 
     leLexer lex;
-    leInit(&lex, source);
-    leLineComment(&lex, "--");
-    leBlockComment(&lex, "--[[", "]]");
+    leInitNamed(&lex, source, argc > 1 ? argv[1] : "<test>");
+    setupLexer(&lex);
 
-    leOperators(&lex,
-        "+", T_PLUS, "-", T_MINUS, "*", T_STAR, "/", T_SLASH,
-        "%", T_PERCENT, "^", T_CARET, "#", T_HASH,
-        "...", T_DOTDOTDOT, "..", T_DOTDOT, ".", T_DOT,
-        "==", T_EQEQ, "~=", T_NEQ, "<=", T_LTE, ">=", T_GTE,
-        "<", T_LT, ">", T_GT, "=", T_EQ,
-        "(", T_LPAREN, ")", T_RPAREN,
-        "[", T_LBRACKET, "]", T_RBRACKET,
-        "{", T_LBRACE, "}", T_RBRACE,
-        ";", T_SEMI, ":", T_COLON, ",", T_COMMA,
-        NULL);
+    leParser parser;
+    leParserInit(&parser, &lex);
+    setupParser(&parser);
 
-    leKeywords(&lex,
-        "and", KW_AND, "break", KW_BREAK, "do", KW_DO,
-        "else", KW_ELSE, "elseif", KW_ELSEIF, "end", KW_END,
-        "false", KW_FALSE, "for", KW_FOR, "function", KW_FUNCTION,
-        "if", KW_IF, "in", KW_IN, "local", KW_LOCAL,
-        "nil", KW_NIL, "not", KW_NOT, "or", KW_OR,
-        "repeat", KW_REPEAT, "return", KW_RETURN, "then", KW_THEN,
-        "true", KW_TRUE, "until", KW_UNTIL, "while", KW_WHILE,
-        NULL);
+    leAstNode *program = parseBlock(&parser);
 
-    LuaParser L;
-    luaParserInit(&L, &lex);
-
-    leAstNode *program = parseBlock(&L);
-
-    if (leParserHadError(&L.p)) {
+    if (leParserHadError(&parser)) {
         printf("--- ERRORS ---\n");
-        leErrorNode *err = leParserFirstError(&L.p);
-        while (err) {
-            printf("  %s\n", leParserFormatError(&L.p, err));
-            err = leNextErrorNode(err);
-        }
+        for (leErrorNode *e = leParserFirstError(&parser); e; e = leNextErrorNode(e))
+            printf("  %s\n", leParserFormatError(&parser, e));
         printf("\n");
     }
 
     printf("--- Lua AST ---\n");
     printAST(program, 0);
 
-    luaParserFree(&L);
+    leParserFree(&parser);
     leFree(&lex);
-    if (source != test_program) free((void *)source);
+    free(fileBuf);
     return 0;
 }
