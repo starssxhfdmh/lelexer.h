@@ -18,10 +18,16 @@
 *       - Multi-line string literal support
 *       - Case-insensitive keyword matching (optional)
 *       - Numeric underscore separators (optional)
+*       - Pratt parser with user-defined prefix/infix/statement rules
+*       - Unlimited precedence levels and configurable associativity
+*       - Arena-allocated AST nodes with minimal built-in types
+*       - Error recovery via synchronization points
 *
 *   CONFIGURATION:
 *       #define LE_ARENA_DEFAULT_CAP    - Initial arena block size (default: 8192)
 *       #define LE_HASH_SIZE            - Keyword hash table bucket count (default: 256)
+*       #define LE_PARSER_HASH_SIZE     - Parser rule hash table bucket count (default: 64)
+*       #define LE_PARSER_SYNC_INIT_CAP - Initial sync token array capacity (default: 16)
 *       #define LE_STATIC               - Make all API functions static
 *       #define LEDEF                   - Override function linkage specifier
 *
@@ -369,6 +375,211 @@ LEDEF int          leUtf8Decode(const char *s, int len, int *codepoint);        
 LEDEF int          leUtf8Encode(int cp, char *out);                                                // Encode codepoint to UTF-8, return bytes written
 LEDEF bool         leIsUnicodeIdStart(int cp);                                                     // Check if codepoint is valid identifier start (UAX #31 subset)
 LEDEF bool         leIsUnicodeIdCont(int cp);                                                      // Check if codepoint is valid identifier continuation
+
+//----------------------------------------------------------------------------------
+// Built-in AST Node Types
+//----------------------------------------------------------------------------------
+// NOTE: User-defined node types should start at LE_PNODE_USER (64) or higher.
+enum {
+    LE_PNODE_NONE = 0,                           // Empty / uninitialized node
+    LE_PNODE_ATOM,                               // Leaf node (any single token)
+    LE_PNODE_UNARY,                              // Unary operation (operator + one child)
+    LE_PNODE_BINARY,                             // Binary operation (operator + two children)
+    LE_PNODE_LIST,                               // Ordered list of child nodes (linked via next)
+    LE_PNODE_ERROR,                              // Error recovery placeholder
+    LE_PNODE_USER = 64                           // First available for user-defined node types
+};
+
+//----------------------------------------------------------------------------------
+// Associativity
+//----------------------------------------------------------------------------------
+enum {
+    LE_ASSOC_LEFT  = 0,                          // Left-associative
+    LE_ASSOC_RIGHT = 1,                          // Right-associative
+    LE_ASSOC_NONE  = 2                           // Non-associative
+};
+
+//----------------------------------------------------------------------------------
+// Parser Error Codes
+//----------------------------------------------------------------------------------
+// NOTE: Parser error codes start at LE_PERR_BASE (512) to avoid collision with
+// lexer error codes. User parser errors start at LE_PERR_USER (768).
+enum {
+    LE_PERR_BASE = 512,
+    LE_PERR_UNEXPECTED_TOKEN,                    // Unexpected token encountered
+    LE_PERR_EXPECTED_TOKEN,                      // Expected a specific token type
+    LE_PERR_NO_PREFIX_RULE,                      // No prefix parselet for token
+    LE_PERR_MAX_ERRORS,                          // Maximum error count reached
+    LE_PERR_USER = 768                           // First available for user parser errors
+};
+
+//----------------------------------------------------------------------------------
+// Parser Configuration Defaults
+//----------------------------------------------------------------------------------
+#ifndef LE_PARSER_HASH_SIZE
+#define LE_PARSER_HASH_SIZE 64                   // Hash table bucket count for rule lookups
+#endif
+
+#ifndef LE_PARSER_SYNC_INIT_CAP
+#define LE_PARSER_SYNC_INIT_CAP 16               // Initial capacity for sync token list
+#endif
+
+//----------------------------------------------------------------------------------
+// AST Node Structure
+//----------------------------------------------------------------------------------
+typedef struct leAstNode leAstNode;
+struct leAstNode {
+    int           type;                          // Node type (LE_PNODE_* or user-defined)
+    leToken       token;                         // Associated token
+    leSourceLoc   loc;                           // Start source location
+    leSourceLoc   endLoc;                        // End source location
+    leAstNode    *left;                          // First child / left operand
+    leAstNode    *right;                         // Second child / right operand
+    leAstNode    *extra;                         // Third child (user-defined semantics)
+    leAstNode    *next;                          // Sibling link (for lists)
+    int           childCount;                    // Number of children in list
+    void         *data;                          // User-attached opaque data
+};
+
+//----------------------------------------------------------------------------------
+// Parser Forward Declaration and Callback Types
+//----------------------------------------------------------------------------------
+typedef struct leParser leParser;
+typedef leAstNode *(*leParsePrefixFn)(leParser *p, leToken tok);
+typedef leAstNode *(*leParseInfixFn)(leParser *p, leAstNode *left, leToken tok);
+typedef leAstNode *(*leParseStmtFn)(leParser *p, leToken tok);
+typedef bool (*leParserErrorHandlerFn)(leParser *p, const leErrorNode *err, void *userData);
+
+//----------------------------------------------------------------------------------
+// Parser Rule Entry Structures (hash chain nodes)
+//----------------------------------------------------------------------------------
+typedef struct lePrefixEntry {
+    int              tokenType;
+    leParsePrefixFn  fn;
+    struct lePrefixEntry *next;
+} lePrefixEntry;
+
+typedef struct leInfixEntry {
+    int              tokenType;
+    int              precedence;
+    int              assoc;
+    leParseInfixFn   fn;
+    struct leInfixEntry *next;
+} leInfixEntry;
+
+typedef struct leStmtEntry {
+    int              tokenType;
+    leParseStmtFn    fn;
+    struct leStmtEntry *next;
+} leStmtEntry;
+
+//----------------------------------------------------------------------------------
+// Parser State
+//----------------------------------------------------------------------------------
+struct leParser {
+    leLexer         *lex;                        // Underlying lexer (NOT owned)
+    leToken          current;                    // Current unconsumed token
+    leToken          previous;                   // Last consumed token
+    bool             hadError;                   // Any error occurred
+    bool             panicMode;                  // Skipping tokens for recovery
+
+    leArena          arena;                      // AST node allocation arena
+    leArena          configArena;                // Rule registration arena (survives reset)
+
+    lePrefixEntry   *prefixTable[LE_PARSER_HASH_SIZE];
+    leInfixEntry    *infixTable[LE_PARSER_HASH_SIZE];
+    leStmtEntry     *stmtTable[LE_PARSER_HASH_SIZE];
+
+    leErrorList      errors;                     // Parser errors
+    leParserErrorHandlerFn errorHandler;
+    void            *errorUserData;
+    int              maxErrors;
+
+    int             *syncTokens;                 // Sync point token types
+    int              syncCount;
+    int              syncCap;
+
+    leParsePrefixFn  defaultPrefix;              // Fallback prefix parselet
+    leParseStmtFn    defaultStmt;                // Fallback statement parselet
+};
+
+//----------------------------------------------------------------------------------
+// Parser Initialization and Lifecycle
+//----------------------------------------------------------------------------------
+LEDEF void         leParserInit(leParser *p, leLexer *lex);                                        // Initialize parser with lexer, prime first token
+LEDEF void         leParserFree(leParser *p);                                                      // Free all parser memory
+LEDEF void         leParserReset(leParser *p);                                                     // Reset state, keep rules
+
+//----------------------------------------------------------------------------------
+// Parser Rule Registration
+//----------------------------------------------------------------------------------
+LEDEF void         leParserPrefix(leParser *p, int tokenType, leParsePrefixFn fn);                  // Register prefix parselet
+LEDEF void         leParserInfix(leParser *p, int tokenType, int prec, int assoc, leParseInfixFn fn);// Register infix parselet
+LEDEF void         leParserStmt(leParser *p, int tokenType, leParseStmtFn fn);                      // Register statement parselet
+LEDEF void         leParserDefaultPrefix(leParser *p, leParsePrefixFn fn);                          // Set fallback prefix parselet
+LEDEF void         leParserDefaultStmt(leParser *p, leParseStmtFn fn);                              // Set fallback statement parselet
+LEDEF void         leParserSyncOn(leParser *p, int tokenType);                                      // Register sync point token type
+
+//----------------------------------------------------------------------------------
+// Parser Core
+//----------------------------------------------------------------------------------
+LEDEF leAstNode   *leParseExpr(leParser *p, int minPrec);                                           // Parse expression with minimum precedence
+LEDEF leAstNode   *leParseStmt(leParser *p);                                                        // Parse one statement
+LEDEF leAstNode   *leParseAll(leParser *p);                                                         // Parse until EOF, return list node
+
+//----------------------------------------------------------------------------------
+// Parser Token Consumption
+//----------------------------------------------------------------------------------
+LEDEF leToken      leParserAdvance(leParser *p);                                                    // Consume and return current token
+LEDEF bool         leParserCheck(leParser *p, int type);                                            // Check current token type
+LEDEF bool         leParserMatch(leParser *p, int type);                                            // Consume if matches, return success
+LEDEF leToken      leParserExpect(leParser *p, int type, const char *msg);                          // Consume or report error
+LEDEF leToken      leParserPeek(leParser *p);                                                       // Get current token
+LEDEF leToken      leParserPrevious(leParser *p);                                                   // Get last consumed token
+LEDEF bool         leParserAtEnd(leParser *p);                                                      // Check if at EOF
+
+//----------------------------------------------------------------------------------
+// Parser Rule Introspection
+//----------------------------------------------------------------------------------
+LEDEF int          leParserGetPrec(leParser *p, int tokenType);                                     // Get precedence (0 if not found)
+LEDEF int          leParserGetAssoc(leParser *p, int tokenType);                                    // Get associativity (LEFT if not found)
+LEDEF bool         leParserHasPrefix(leParser *p, int tokenType);                                   // Check if prefix rule exists
+LEDEF bool         leParserHasInfix(leParser *p, int tokenType);                                    // Check if infix rule exists
+LEDEF bool         leParserHasStmt(leParser *p, int tokenType);                                     // Check if statement rule exists
+
+//----------------------------------------------------------------------------------
+// AST Node Construction
+//----------------------------------------------------------------------------------
+LEDEF leAstNode   *leAstNew(leParser *p, int type, leToken tok);                                    // Allocate new node
+LEDEF leAstNode   *leAstAtom(leParser *p, leToken tok);                                             // Create atom leaf node
+LEDEF leAstNode   *leAstUnary(leParser *p, leToken op, leAstNode *operand);                         // Create unary node
+LEDEF leAstNode   *leAstBinary(leParser *p, leToken op, leAstNode *left, leAstNode *right);         // Create binary node
+LEDEF leAstNode   *leAstList(leParser *p);                                                          // Create empty list node
+LEDEF leAstNode   *leAstListAppend(leParser *p, leAstNode *list, leAstNode *item);                  // Append to list
+LEDEF leAstNode   *leAstError(leParser *p, leToken tok);                                            // Create error placeholder
+
+//----------------------------------------------------------------------------------
+// Parser Error Handling
+//----------------------------------------------------------------------------------
+LEDEF void         leParserError(leParser *p, const char *msg);                                     // Error at current token
+LEDEF void         leParserErrorAt(leParser *p, leToken tok, const char *msg);                      // Error at specific token
+LEDEF void         leParserErrorf(leParser *p, const char *fmt, ...);                               // Error with printf formatting
+LEDEF void         leParserErrorfAt(leParser *p, leToken tok, const char *fmt, ...);                // Error at token with formatting
+LEDEF void         leParserSynchronize(leParser *p);                                                // Skip to next sync point
+LEDEF bool         leParserHadError(leParser *p);                                                   // Check if error occurred
+LEDEF int          leParserErrorCount(leParser *p);                                                 // Get error count
+LEDEF leErrorNode *leParserFirstError(leParser *p);                                                 // Get first error
+LEDEF void         leParserClearErrors(leParser *p);                                                // Clear all errors
+LEDEF const char  *leParserFormatError(leParser *p, const leErrorNode *err);                        // Format error string
+LEDEF void         leParserSetErrorHandler(leParser *p, leParserErrorHandlerFn fn, void *userData);  // Set error callback
+LEDEF void         leParserSetMaxErrors(leParser *p, int max);                                      // Set max errors (0=unlimited)
+
+//----------------------------------------------------------------------------------
+// AST Utilities
+//----------------------------------------------------------------------------------
+LEDEF const char  *leAstNodeTypeName(int type);                                                     // Get node type name
+LEDEF void         leAstPrint(leAstNode *node, int indent);                                         // Print AST to stdout
+LEDEF void         leAstPrintFile(leAstNode *node, int indent, FILE *out);                          // Print AST to file
 
 #ifdef LE_IMPLEMENTATION
 
@@ -1637,6 +1848,519 @@ LEDEF bool lePeekTokenN(leLexer *lex, leToken *tok, int n) {
         return tok->type != leEOF;
     }
     return false;
+}
+
+static unsigned int leParserHash(int tokenType) {
+    unsigned int h = (unsigned int)tokenType;
+    h = ((h >> 16) ^ h) * 0x45d9f3b;
+    h = ((h >> 16) ^ h) * 0x45d9f3b;
+    h = (h >> 16) ^ h;
+    return h % LE_PARSER_HASH_SIZE;
+}
+
+LEDEF void leParserInit(leParser *p, leLexer *lex) {
+    if (!p || !lex) return;
+    memset(p, 0, sizeof(leParser));
+    p->lex = lex;
+    p->hadError = false;
+    p->panicMode = false;
+    leArenaInit(&p->arena);
+    leArenaInit(&p->configArena);
+    memset(p->prefixTable, 0, sizeof(p->prefixTable));
+    memset(p->infixTable, 0, sizeof(p->infixTable));
+    memset(p->stmtTable, 0, sizeof(p->stmtTable));
+    leErrorListInit(&p->errors);
+    p->errorHandler = NULL;
+    p->errorUserData = NULL;
+    p->maxErrors = 0;
+    p->syncTokens = NULL;
+    p->syncCount = 0;
+    p->syncCap = 0;
+    p->defaultPrefix = NULL;
+    p->defaultStmt = NULL;
+    leNextToken(lex, &p->current);
+    memset(&p->previous, 0, sizeof(leToken));
+}
+
+LEDEF void leParserFree(leParser *p) {
+    if (!p) return;
+    leArenaDestroy(&p->arena);
+    leArenaDestroy(&p->configArena);
+    if (p->syncTokens) {
+        free(p->syncTokens);
+        p->syncTokens = NULL;
+    }
+    p->syncCount = 0;
+    p->syncCap = 0;
+    memset(p->prefixTable, 0, sizeof(p->prefixTable));
+    memset(p->infixTable, 0, sizeof(p->infixTable));
+    memset(p->stmtTable, 0, sizeof(p->stmtTable));
+    leErrorListInit(&p->errors);
+}
+
+LEDEF void leParserReset(leParser *p) {
+    if (!p) return;
+    leArenaReset(&p->arena);
+    leErrorListClear(&p->errors);
+    p->hadError = false;
+    p->panicMode = false;
+    leNextToken(p->lex, &p->current);
+    memset(&p->previous, 0, sizeof(leToken));
+}
+
+LEDEF void leParserPrefix(leParser *p, int tokenType, leParsePrefixFn fn) {
+    if (!p || !fn) return;
+    unsigned int bucket = leParserHash(tokenType);
+    lePrefixEntry *e = p->prefixTable[bucket];
+    while (e) {
+        if (e->tokenType == tokenType) { e->fn = fn; return; }
+        e = e->next;
+    }
+    e = (lePrefixEntry *)leArenaAlloc(&p->configArena, sizeof(lePrefixEntry));
+    if (!e) return;
+    e->tokenType = tokenType;
+    e->fn = fn;
+    e->next = p->prefixTable[bucket];
+    p->prefixTable[bucket] = e;
+}
+
+LEDEF void leParserInfix(leParser *p, int tokenType, int prec, int assoc, leParseInfixFn fn) {
+    if (!p || !fn) return;
+    unsigned int bucket = leParserHash(tokenType);
+    leInfixEntry *e = p->infixTable[bucket];
+    while (e) {
+        if (e->tokenType == tokenType) { e->fn = fn; e->precedence = prec; e->assoc = assoc; return; }
+        e = e->next;
+    }
+    e = (leInfixEntry *)leArenaAlloc(&p->configArena, sizeof(leInfixEntry));
+    if (!e) return;
+    e->tokenType = tokenType;
+    e->precedence = prec;
+    e->assoc = assoc;
+    e->fn = fn;
+    e->next = p->infixTable[bucket];
+    p->infixTable[bucket] = e;
+}
+
+LEDEF void leParserStmt(leParser *p, int tokenType, leParseStmtFn fn) {
+    if (!p || !fn) return;
+    unsigned int bucket = leParserHash(tokenType);
+    leStmtEntry *e = p->stmtTable[bucket];
+    while (e) {
+        if (e->tokenType == tokenType) { e->fn = fn; return; }
+        e = e->next;
+    }
+    e = (leStmtEntry *)leArenaAlloc(&p->configArena, sizeof(leStmtEntry));
+    if (!e) return;
+    e->tokenType = tokenType;
+    e->fn = fn;
+    e->next = p->stmtTable[bucket];
+    p->stmtTable[bucket] = e;
+}
+
+LEDEF void leParserDefaultPrefix(leParser *p, leParsePrefixFn fn) {
+    if (p) p->defaultPrefix = fn;
+}
+
+LEDEF void leParserDefaultStmt(leParser *p, leParseStmtFn fn) {
+    if (p) p->defaultStmt = fn;
+}
+
+LEDEF void leParserSyncOn(leParser *p, int tokenType) {
+    if (!p) return;
+    for (int i = 0; i < p->syncCount; i++) {
+        if (p->syncTokens[i] == tokenType) return;
+    }
+    if (p->syncCount >= p->syncCap) {
+        int newCap = p->syncCap == 0 ? LE_PARSER_SYNC_INIT_CAP : p->syncCap * 2;
+        int *newArr = (int *)malloc(newCap * sizeof(int));
+        if (!newArr) return;
+        if (p->syncTokens) {
+            memcpy(newArr, p->syncTokens, p->syncCount * sizeof(int));
+            free(p->syncTokens);
+        }
+        p->syncTokens = newArr;
+        p->syncCap = newCap;
+    }
+    p->syncTokens[p->syncCount++] = tokenType;
+}
+
+static lePrefixEntry *leParserFindPrefix(leParser *p, int tokenType) {
+    unsigned int bucket = leParserHash(tokenType);
+    lePrefixEntry *e = p->prefixTable[bucket];
+    while (e) {
+        if (e->tokenType == tokenType) return e;
+        e = e->next;
+    }
+    return NULL;
+}
+
+static leInfixEntry *leParserFindInfix(leParser *p, int tokenType) {
+    unsigned int bucket = leParserHash(tokenType);
+    leInfixEntry *e = p->infixTable[bucket];
+    while (e) {
+        if (e->tokenType == tokenType) return e;
+        e = e->next;
+    }
+    return NULL;
+}
+
+static leStmtEntry *leParserFindStmt(leParser *p, int tokenType) {
+    unsigned int bucket = leParserHash(tokenType);
+    leStmtEntry *e = p->stmtTable[bucket];
+    while (e) {
+        if (e->tokenType == tokenType) return e;
+        e = e->next;
+    }
+    return NULL;
+}
+
+LEDEF leToken leParserAdvance(leParser *p) {
+    p->previous = p->current;
+    if (p->current.type != leEOF) {
+        leNextToken(p->lex, &p->current);
+    }
+    return p->previous;
+}
+
+LEDEF bool leParserCheck(leParser *p, int type) {
+    return p->current.type == type;
+}
+
+LEDEF bool leParserMatch(leParser *p, int type) {
+    if (p->current.type != type) return false;
+    leParserAdvance(p);
+    return true;
+}
+
+LEDEF leToken leParserExpect(leParser *p, int type, const char *msg) {
+    if (p->current.type == type) {
+        return leParserAdvance(p);
+    }
+    leParserError(p, msg);
+    leToken errTok;
+    memset(&errTok, 0, sizeof(leToken));
+    errTok.type = leError;
+    errTok.loc = p->current.loc;
+    errTok.endLoc = p->current.endLoc;
+    return errTok;
+}
+
+LEDEF leToken leParserPeek(leParser *p) {
+    return p->current;
+}
+
+LEDEF leToken leParserPrevious(leParser *p) {
+    return p->previous;
+}
+
+LEDEF bool leParserAtEnd(leParser *p) {
+    return p->current.type == leEOF;
+}
+
+LEDEF int leParserGetPrec(leParser *p, int tokenType) {
+    leInfixEntry *e = leParserFindInfix(p, tokenType);
+    return e ? e->precedence : 0;
+}
+
+LEDEF int leParserGetAssoc(leParser *p, int tokenType) {
+    leInfixEntry *e = leParserFindInfix(p, tokenType);
+    return e ? e->assoc : LE_ASSOC_LEFT;
+}
+
+LEDEF bool leParserHasPrefix(leParser *p, int tokenType) {
+    return leParserFindPrefix(p, tokenType) != NULL;
+}
+
+LEDEF bool leParserHasInfix(leParser *p, int tokenType) {
+    return leParserFindInfix(p, tokenType) != NULL;
+}
+
+LEDEF bool leParserHasStmt(leParser *p, int tokenType) {
+    return leParserFindStmt(p, tokenType) != NULL;
+}
+
+LEDEF leAstNode *leAstNew(leParser *p, int type, leToken tok) {
+    leAstNode *node = (leAstNode *)leArenaAlloc(&p->arena, sizeof(leAstNode));
+    if (!node) return NULL;
+    node->type = type;
+    node->token = tok;
+    node->loc = tok.loc;
+    node->endLoc = tok.endLoc;
+    node->left = NULL;
+    node->right = NULL;
+    node->extra = NULL;
+    node->next = NULL;
+    node->childCount = 0;
+    node->data = NULL;
+    return node;
+}
+
+LEDEF leAstNode *leAstAtom(leParser *p, leToken tok) {
+    return leAstNew(p, LE_PNODE_ATOM, tok);
+}
+
+LEDEF leAstNode *leAstUnary(leParser *p, leToken op, leAstNode *operand) {
+    leAstNode *node = leAstNew(p, LE_PNODE_UNARY, op);
+    if (!node) return NULL;
+    node->left = operand;
+    if (operand) node->endLoc = operand->endLoc;
+    return node;
+}
+
+LEDEF leAstNode *leAstBinary(leParser *p, leToken op, leAstNode *left, leAstNode *right) {
+    leAstNode *node = leAstNew(p, LE_PNODE_BINARY, op);
+    if (!node) return NULL;
+    node->left = left;
+    node->right = right;
+    if (left) node->loc = left->loc;
+    if (right) node->endLoc = right->endLoc;
+    return node;
+}
+
+LEDEF leAstNode *leAstList(leParser *p) {
+    leToken emptyTok;
+    memset(&emptyTok, 0, sizeof(leToken));
+    leAstNode *node = leAstNew(p, LE_PNODE_LIST, emptyTok);
+    if (!node) return NULL;
+    node->childCount = 0;
+    return node;
+}
+
+LEDEF leAstNode *leAstListAppend(leParser *p, leAstNode *list, leAstNode *item) {
+    (void)p;
+    if (!list || !item) return list;
+    if (!list->left) {
+        list->left = item;
+    } else {
+        leAstNode *tail = list->left;
+        while (tail->next) tail = tail->next;
+        tail->next = item;
+    }
+    item->next = NULL;
+    list->childCount++;
+    if (list->childCount == 1) list->loc = item->loc;
+    list->endLoc = item->endLoc;
+    return list;
+}
+
+LEDEF leAstNode *leAstError(leParser *p, leToken tok) {
+    return leAstNew(p, LE_PNODE_ERROR, tok);
+}
+
+static void leParserErrorDispatch(leParser *p, int code, int severity, const char *msg, leSourceLoc loc, leSourceLoc endLoc) {
+    p->hadError = true;
+    leErrorNode tmpNode;
+    tmpNode.message = msg;
+    tmpNode.code = code;
+    tmpNode.severity = severity;
+    tmpNode.loc = loc;
+    tmpNode.endLoc = endLoc;
+    tmpNode.next = NULL;
+    bool shouldCollect = true;
+    if (p->errorHandler) {
+        shouldCollect = p->errorHandler(p, &tmpNode, p->errorUserData);
+    }
+    if (shouldCollect) {
+        if (p->maxErrors <= 0 || p->errors.count < p->maxErrors) {
+            const char *duped = leArenaDupStr(&p->arena, msg, (int)strlen(msg));
+            leErrorListPush(&p->arena, &p->errors, code, severity, duped ? duped : msg, loc, endLoc);
+        }
+    }
+}
+
+LEDEF void leParserError(leParser *p, const char *msg) {
+    if (p->panicMode) return;
+    p->panicMode = true;
+    leParserErrorDispatch(p, LE_PERR_UNEXPECTED_TOKEN, LE_SEVERITY_ERROR, msg, p->current.loc, p->current.endLoc);
+}
+
+LEDEF void leParserErrorAt(leParser *p, leToken tok, const char *msg) {
+    if (p->panicMode) return;
+    p->panicMode = true;
+    leParserErrorDispatch(p, LE_PERR_UNEXPECTED_TOKEN, LE_SEVERITY_ERROR, msg, tok.loc, tok.endLoc);
+}
+
+LEDEF void leParserErrorf(leParser *p, const char *fmt, ...) {
+    if (p->panicMode) return;
+    p->panicMode = true;
+    va_list args;
+    va_start(args, fmt);
+    va_list args2;
+    va_copy(args2, args);
+    int needed = vsnprintf(NULL, 0, fmt, args) + 1;
+    va_end(args);
+    char *buf = (char *)leArenaAlloc(&p->arena, needed);
+    if (buf) vsnprintf(buf, needed, fmt, args2);
+    va_end(args2);
+    leParserErrorDispatch(p, LE_PERR_UNEXPECTED_TOKEN, LE_SEVERITY_ERROR, buf ? buf : fmt, p->current.loc, p->current.endLoc);
+}
+
+LEDEF void leParserErrorfAt(leParser *p, leToken tok, const char *fmt, ...) {
+    if (p->panicMode) return;
+    p->panicMode = true;
+    va_list args;
+    va_start(args, fmt);
+    va_list args2;
+    va_copy(args2, args);
+    int needed = vsnprintf(NULL, 0, fmt, args) + 1;
+    va_end(args);
+    char *buf = (char *)leArenaAlloc(&p->arena, needed);
+    if (buf) vsnprintf(buf, needed, fmt, args2);
+    va_end(args2);
+    leParserErrorDispatch(p, LE_PERR_UNEXPECTED_TOKEN, LE_SEVERITY_ERROR, buf ? buf : fmt, tok.loc, tok.endLoc);
+}
+
+LEDEF void leParserSynchronize(leParser *p) {
+    p->panicMode = false;
+    while (p->current.type != leEOF) {
+        for (int i = 0; i < p->syncCount; i++) {
+            if (p->current.type == p->syncTokens[i]) return;
+        }
+        leParserAdvance(p);
+    }
+}
+
+LEDEF bool leParserHadError(leParser *p) { return p->hadError; }
+LEDEF int leParserErrorCount(leParser *p) { return p->errors.count; }
+LEDEF leErrorNode *leParserFirstError(leParser *p) { return p->errors.head; }
+
+LEDEF void leParserClearErrors(leParser *p) {
+    leErrorListClear(&p->errors);
+    p->hadError = false;
+    p->panicMode = false;
+}
+
+LEDEF const char *leParserFormatError(leParser *p, const leErrorNode *err) {
+    const char *sev = leSeverityName(err->severity);
+    const char *fname = p->lex->fileName ? p->lex->fileName : "<input>";
+    int needed = (int)strlen(fname) + (int)strlen(sev) + (int)strlen(err->message) + 64;
+    char *buf = (char *)leArenaAlloc(&p->arena, needed);
+    if (!buf) return err->message;
+    snprintf(buf, needed, "%s:%d:%d: %s: %s", fname, err->loc.line, err->loc.col, sev, err->message);
+    return buf;
+}
+
+LEDEF void leParserSetErrorHandler(leParser *p, leParserErrorHandlerFn fn, void *userData) {
+    if (!p) return;
+    p->errorHandler = fn;
+    p->errorUserData = userData;
+}
+
+LEDEF void leParserSetMaxErrors(leParser *p, int max) {
+    if (p) p->maxErrors = max;
+}
+
+LEDEF leAstNode *leParseExpr(leParser *p, int minPrec) {
+    if (leParserAtEnd(p)) {
+        leParserError(p, "unexpected end of input in expression");
+        return leAstError(p, p->current);
+    }
+    leToken tok = leParserAdvance(p);
+    lePrefixEntry *prefix = leParserFindPrefix(p, tok.type);
+    leAstNode *left = NULL;
+    if (prefix) {
+        left = prefix->fn(p, tok);
+    } else if (p->defaultPrefix) {
+        left = p->defaultPrefix(p, tok);
+    } else {
+        leParserErrorfAt(p, tok, "unexpected token in expression");
+        return leAstError(p, tok);
+    }
+    if (!left) return leAstError(p, tok);
+    for (;;) {
+        if (leParserAtEnd(p)) break;
+        leInfixEntry *infix = leParserFindInfix(p, p->current.type);
+        if (!infix) break;
+        int prec = infix->precedence;
+        if (prec < minPrec) break;
+        if (infix->assoc == LE_ASSOC_LEFT && prec <= minPrec) break;
+        tok = leParserAdvance(p);
+        left = infix->fn(p, left, tok);
+        if (!left) return leAstError(p, tok);
+    }
+    return left;
+}
+
+LEDEF leAstNode *leParseStmt(leParser *p) {
+    if (leParserAtEnd(p)) return NULL;
+    leStmtEntry *stmt = leParserFindStmt(p, p->current.type);
+    if (stmt) {
+        leToken tok = leParserAdvance(p);
+        leAstNode *node = stmt->fn(p, tok);
+        if (p->panicMode) leParserSynchronize(p);
+        return node;
+    }
+    if (p->defaultStmt) {
+        leToken tok = leParserAdvance(p);
+        leAstNode *node = p->defaultStmt(p, tok);
+        if (p->panicMode) leParserSynchronize(p);
+        return node;
+    }
+    leAstNode *node = leParseExpr(p, 0);
+    if (p->panicMode) leParserSynchronize(p);
+    return node;
+}
+
+LEDEF leAstNode *leParseAll(leParser *p) {
+    leAstNode *list = leAstList(p);
+    if (!list) return NULL;
+    while (!leParserAtEnd(p)) {
+        leAstNode *s = leParseStmt(p);
+        if (s) {
+            leAstListAppend(p, list, s);
+        } else {
+            if (!leParserAtEnd(p)) leParserAdvance(p);
+        }
+    }
+    return list;
+}
+
+LEDEF const char *leAstNodeTypeName(int type) {
+    switch (type) {
+        case LE_PNODE_NONE:   return "None";
+        case LE_PNODE_ATOM:   return "Atom";
+        case LE_PNODE_UNARY:  return "Unary";
+        case LE_PNODE_BINARY: return "Binary";
+        case LE_PNODE_LIST:   return "List";
+        case LE_PNODE_ERROR:  return "Error";
+        default:              return "User";
+    }
+}
+
+static void leAstPrintIndent(FILE *out, int indent) {
+    for (int i = 0; i < indent; i++) fprintf(out, "  ");
+}
+
+LEDEF void leAstPrintFile(leAstNode *node, int indent, FILE *out) {
+    if (!node) {
+        leAstPrintIndent(out, indent);
+        fprintf(out, "(null)\n");
+        return;
+    }
+    leAstPrintIndent(out, indent);
+    if (node->type >= LE_PNODE_USER)
+        fprintf(out, "User(%d)", node->type);
+    else
+        fprintf(out, "%s", leAstNodeTypeName(node->type));
+    if (node->token.start && node->token.len > 0)
+        fprintf(out, " \"%.*s\"", node->token.len, node->token.start);
+    fprintf(out, " [%d:%d-%d:%d]\n", node->loc.line, node->loc.col, node->endLoc.line, node->endLoc.col);
+    if (node->type == LE_PNODE_LIST) {
+        leAstNode *child = node->left;
+        while (child) {
+            leAstPrintFile(child, indent + 1, out);
+            child = child->next;
+        }
+    } else {
+        if (node->left)  leAstPrintFile(node->left, indent + 1, out);
+        if (node->right) leAstPrintFile(node->right, indent + 1, out);
+        if (node->extra) leAstPrintFile(node->extra, indent + 1, out);
+    }
+}
+
+LEDEF void leAstPrint(leAstNode *node, int indent) {
+    leAstPrintFile(node, indent, stdout);
 }
 
 #endif
