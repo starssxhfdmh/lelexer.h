@@ -2277,7 +2277,7 @@ LEDEF leAstNode *leParseExpr(leParser *p, int minPrec) {
     } else if (p->defaultPrefix) {
         left = p->defaultPrefix(p, tok);
     } else {
-        leParserErrorfAt(p, tok, "unexpected token in expression");
+        leParserErrorfAt(p, tok, "unexpected token '%.*s'. expected expression", tok.len > 20 ? 20 : tok.len, tok.start);
         return leAstError(p, tok);
     }
     if (!left) return leAstError(p, tok);
